@@ -2,7 +2,6 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
 import {
   mockUsers,
   mockCourses,
@@ -14,7 +13,11 @@ import {
   mockAttendance,
   mockNotifications,
   mockAuditLogs,
-  mockParentReviews
+  mockParentReviews,
+  mockAcademicClasses,
+  mockRegistrationRequests,
+  mockFeeRecords,
+  mockTimetableSlots
 } from './src/data/mockData';
 
 const app = express();
@@ -34,6 +37,20 @@ let attendanceStore = [...mockAttendance];
 let notificationsStore = [...mockNotifications];
 let auditLogsStore = [...mockAuditLogs];
 let parentReviewsStore = [...mockParentReviews];
+let classesStore = [...mockAcademicClasses];
+let registrationRequestsStore = [...mockRegistrationRequests];
+let feeStore = [...mockFeeRecords];
+let timetableStore = [...mockTimetableSlots];
+
+// Helper to verify if faculty teaches a course
+function isFacultyAssignedToCourse(course: any, facultyId: string): boolean {
+  if (!course || !facultyId) return false;
+  if (course.facultyId === facultyId) return true;
+  if (course.coFaculties && Array.isArray(course.coFaculties)) {
+    return course.coFaculties.some((cf: any) => cf.facultyId === facultyId);
+  }
+  return false;
+}
 
 // Helper to append audit log
 function addAuditLog(performedBy: string, role: any, action: string, details: string) {
@@ -99,16 +116,59 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
   });
 });
 
-// Self-service Registration / Signup Endpoint (Teacher, Student, Parent)
+// Academic Classes API
+app.get('/api/academic-classes', (req: Request, res: Response) => {
+  res.json(classesStore);
+});
+
+app.post('/api/academic-classes', (req: Request, res: Response) => {
+  const { className, section, department, semester, academicYear, classTeacherId, performedBy, userRole } = req.body;
+  if (!className || !section) {
+    return res.status(400).json({ error: 'Class name and section are required' });
+  }
+
+  // Find class teacher if provided
+  let teacher = usersStore.find((u) => u.id === classTeacherId);
+  if (!teacher) {
+    teacher = usersStore.find((u) => u.role === 'FACULTY');
+  }
+
+  const newClass = {
+    id: `cls-${Date.now()}`,
+    className,
+    section,
+    academicYear: academicYear || '2026-2027',
+    department: department || 'Computer Science',
+    semester: Number(semester) || 1,
+    classTeacherId: teacher?.id || 'usr-fac-1',
+    classTeacherName: teacher?.name || 'Prof. Ananya Sharma',
+    classTeacherEmail: teacher?.email || 'ananya.sharma@edutrack.edu'
+  };
+
+  classesStore.push(newClass);
+
+  if (teacher) {
+    teacher.isClassTeacher = true;
+    teacher.assignedClassId = newClass.id;
+    teacher.assignedClassName = `${newClass.className} (${newClass.section})`;
+  }
+
+  addAuditLog(performedBy || 'Admin', userRole || 'ADMIN', 'CLASS_CREATE', `Created academic class ${newClass.className} (${newClass.section}) assigned to ${newClass.classTeacherName}`);
+
+  res.status(201).json(newClass);
+});
+
+// Self-service Two-Stage Registration / Signup Endpoint (Student & Parent)
 app.post('/api/auth/signup', (req: Request, res: Response) => {
-  const { name, email, role, department, regNumber, childStudentIds } = req.body;
+  const { name, email, role, classId, regNumber, studentId, relationship, department } = req.body;
 
   if (!name || !email || !role) {
     return res.status(400).json({ error: 'Name, email, and role are required' });
   }
 
+  // Explicit Restriction 4: Cannot self-register as ADMIN
   if (role === 'ADMIN') {
-    return res.status(403).json({ error: 'Administrator accounts cannot be created via public registration' });
+    return res.status(403).json({ error: 'Prohibited: Administrator accounts cannot be self-registered publicly.' });
   }
 
   // Check email collision
@@ -117,75 +177,335 @@ app.post('/api/auth/signup', (req: Request, res: Response) => {
     return res.status(409).json({ error: 'An account with this email already exists' });
   }
 
+  // Determine Class and Class Teacher
+  let targetClass = classesStore.find((c) => c.id === classId);
+
+  // For parents: lookup student and their class if classId not provided directly
+  let linkedStudent: any = null;
+  if (role === 'PARENT') {
+    if (studentId) {
+      linkedStudent = usersStore.find((u) => u.id === studentId || u.regNumber === studentId);
+      if (!linkedStudent) {
+        return res.status(404).json({ error: 'Specified student was not found in institutional records.' });
+      }
+      if (linkedStudent.classId) {
+        targetClass = classesStore.find((c) => c.id === linkedStudent.classId);
+      }
+    }
+    if (!targetClass) {
+      targetClass = classesStore[0]; // Fallback to first class in department
+    }
+  }
+
+  if (role === 'STUDENT' && !targetClass) {
+    targetClass = classesStore[0];
+  }
+
+  const assignedTeacherId = targetClass?.classTeacherId || 'usr-fac-1';
+  const assignedTeacherName = targetClass?.classTeacherName || 'Prof. Ananya Sharma';
+
+  const newUserId = `usr-${Date.now()}`;
   const newUser: any = {
-    id: `usr-${Date.now()}`,
+    id: newUserId,
     name: name.trim(),
     email: email.trim().toLowerCase(),
     role,
-    status: 'PENDING', // Requires Admin approval
+    status: 'PENDING',
+    accountStatus: 'PENDING', // Inactive until both stages complete
     createdAt: new Date().toISOString(),
     avatarUrl: `https://images.unsplash.com/photo-${1500000000000 + Math.floor(Math.random() * 100000000)}?w=150&auto=format&fit=crop&q=80`
   };
 
-  if (role === 'FACULTY') {
-    newUser.department = department || 'General Academics';
-  } else if (role === 'STUDENT') {
-    newUser.department = department || 'Computer Science';
-    newUser.regNumber = regNumber || `STU-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`;
-    newUser.semester = 1;
+  if (role === 'STUDENT') {
+    newUser.department = targetClass?.department || department || 'Computer Science';
+    newUser.regNumber = regNumber || `CS-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`;
+    newUser.classId = targetClass?.id;
+    newUser.className = targetClass ? `${targetClass.className} (${targetClass.section})` : 'Class 4A';
+    newUser.semester = targetClass?.semester || 1;
     newUser.gpa = 3.50;
   } else if (role === 'PARENT') {
-    newUser.childStudentIds = childStudentIds || ['usr-stu-1'];
+    newUser.childStudentIds = linkedStudent ? [linkedStudent.id] : (req.body.childStudentIds || ['usr-stu-1']);
+  } else if (role === 'FACULTY') {
+    newUser.department = department || 'General Academics';
   }
 
   usersStore.push(newUser);
 
-  // Notify Administrators of pending registration
+  // Create Registration Request Record for Two-Stage Verification
+  const regReqId = `reg-req-${Date.now()}`;
+  const regRequest: any = {
+    id: regReqId,
+    userId: newUserId,
+    applicantName: newUser.name,
+    applicantEmail: newUser.email,
+    requestedRole: role,
+    classId: targetClass?.id || 'cls-cse-4a',
+    className: targetClass ? `${targetClass.className} (${targetClass.section})` : 'B.Tech CSE - 4A',
+    classSection: targetClass?.section || 'Section A',
+    classTeacherId: assignedTeacherId,
+    classTeacherName: assignedTeacherName,
+    regNumber: newUser.regNumber,
+    department: newUser.department,
+    studentId: linkedStudent?.id,
+    studentName: linkedStudent?.name,
+    relationship: relationship || 'Father',
+    status: 'PENDING_TEACHER_REVIEW',
+    createdAt: new Date().toISOString()
+  };
+
+  registrationRequestsStore.unshift(regRequest);
+
+  // Notify the assigned Class Teacher
   notificationsStore.unshift({
     id: `notif-${Date.now()}`,
-    title: 'New Account Awaiting Approval',
-    message: `${newUser.name} registered as ${newUser.role} (${newUser.email}). Review and approve in Admin Console.`,
+    userId: assignedTeacherId,
+    title: `New ${role} Registration Request`,
+    message: `${newUser.name} registered for ${regRequest.className}. Please review and verify the request.`,
     type: 'SYSTEM',
     createdAt: new Date().toISOString(),
     isRead: false
   });
 
-  addAuditLog(newUser.email, newUser.role, 'USER_SIGNUP_PENDING', `Self-registered new ${newUser.role} account awaiting admin verification`);
+  addAuditLog(newUser.email, newUser.role, 'REGISTRATION_SUBMITTED', `Submitted ${role} registration assigned to Class Teacher ${assignedTeacherName} (${regRequest.className})`);
 
   res.status(201).json({
-    message: 'Registration submitted successfully. Your account is pending Administrator review and approval.',
-    user: newUser
+    message: 'Registration submitted successfully. Your request is waiting for Class Teacher verification before administrative approval.',
+    user: newUser,
+    registrationRequest: regRequest
   });
 });
 
-// Admin Approval / Rejection Endpoint
-app.put('/api/users/:id/approval', (req: Request, res: Response) => {
-  const { status, reviewedBy } = req.body; // 'APPROVED' or 'REJECTED'
-  const index = usersStore.findIndex((u) => u.id === req.params.id);
+// Teacher Registration Requests API
+app.get('/api/faculty/registration-requests', (req: Request, res: Response) => {
+  const { teacherId } = req.query;
+  let results = [...registrationRequestsStore];
+  if (teacherId) {
+    results = results.filter((r) => r.classTeacherId === teacherId);
+  }
+  res.json(results);
+});
+
+// Teacher Stage 1: Confirm Registration
+app.post('/api/faculty/registration-requests/:id/confirm', (req: Request, res: Response) => {
+  const { facultyId, teacherId, facultyName, teacherName, reason, userRole } = req.body;
+  const currentTeacherId = teacherId || facultyId;
+  const currentTeacherName = teacherName || facultyName || 'Class Teacher';
+
+  const index = registrationRequestsStore.findIndex((r) => r.id === req.params.id);
 
   if (index === -1) {
-    return res.status(404).json({ error: 'User not found' });
+    return res.status(404).json({ error: 'Registration request not found' });
   }
 
-  if (!['APPROVED', 'REJECTED'].includes(status)) {
-    return res.status(400).json({ error: 'Invalid status. Must be APPROVED or REJECTED' });
+  const reqItem = registrationRequestsStore[index];
+
+  // Authorization: Must be assigned class teacher
+  if (!currentTeacherId || reqItem.classTeacherId !== currentTeacherId) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned as the Class Teacher for this class.' });
   }
 
-  usersStore[index].status = status;
+  // State Transition Validation: Only PENDING_TEACHER_REVIEW can be confirmed
+  if (reqItem.status !== 'PENDING_TEACHER_REVIEW') {
+    return res.status(400).json({ error: `Invalid transition. Request is in status ${reqItem.status}, not PENDING_TEACHER_REVIEW.` });
+  }
 
+  reqItem.status = 'PENDING_ADMIN_REVIEW';
+  reqItem.teacherReviewedBy = currentTeacherName;
+  reqItem.teacherReviewedAt = new Date().toISOString();
+  reqItem.teacherReviewReason = reason || 'Verified academic credentials and class roster entry.';
+  reqItem.updatedAt = new Date().toISOString();
+
+  // Notify Administrators
   notificationsStore.unshift({
     id: `notif-${Date.now()}`,
-    userId: usersStore[index].id,
-    title: `Account Registration ${status === 'APPROVED' ? 'Approved' : 'Declined'}`,
-    message: `Account for ${usersStore[index].name} (${usersStore[index].email}) was ${status.toLowerCase()} by Administrator.`,
+    title: 'Registration Ready for Administrative Approval',
+    message: `${reqItem.applicantName} (${reqItem.requestedRole}) verified by Class Teacher ${reqItem.teacherReviewedBy}. Ready for final admin approval.`,
     type: 'SYSTEM',
     createdAt: new Date().toISOString(),
     isRead: false
   });
 
-  addAuditLog(reviewedBy || 'Admin', 'ADMIN', `USER_${status}`, `${status} registration for ${usersStore[index].name} (${usersStore[index].email})`);
+  addAuditLog(currentTeacherName, 'FACULTY', 'REGISTRATION_TEACHER_CONFIRMED', `Class Teacher confirmed ${reqItem.requestedRole} registration for ${reqItem.applicantName}`);
 
-  res.json({ success: true, user: usersStore[index] });
+  res.json({ success: true, registrationRequest: reqItem });
+});
+
+// Teacher Stage 1: Reject Registration
+app.post('/api/faculty/registration-requests/:id/reject', (req: Request, res: Response) => {
+  const { facultyId, teacherId, facultyName, teacherName, reason } = req.body;
+  const currentTeacherId = teacherId || facultyId;
+  const currentTeacherName = teacherName || facultyName || 'Class Teacher';
+
+  const index = registrationRequestsStore.findIndex((r) => r.id === req.params.id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Registration request not found' });
+  }
+
+  const reqItem = registrationRequestsStore[index];
+
+  if (!currentTeacherId || reqItem.classTeacherId !== currentTeacherId) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned as the Class Teacher for this class.' });
+  }
+
+  if (reqItem.status !== 'PENDING_TEACHER_REVIEW') {
+    return res.status(400).json({ error: `Invalid transition. Cannot reject request in status ${reqItem.status}.` });
+  }
+
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: 'A specific reason is required to reject a registration.' });
+  }
+
+  reqItem.status = 'REJECTED_BY_TEACHER';
+  reqItem.teacherReviewedBy = currentTeacherName;
+  reqItem.teacherReviewedAt = new Date().toISOString();
+  reqItem.teacherReviewReason = reason.trim();
+  reqItem.updatedAt = new Date().toISOString();
+
+  // Update user account status
+  const userIdx = usersStore.findIndex((u) => u.id === reqItem.userId);
+  if (userIdx !== -1) {
+    usersStore[userIdx].status = 'REJECTED';
+    usersStore[userIdx].accountStatus = 'REJECTED';
+  }
+
+  addAuditLog(currentTeacherName, 'FACULTY', 'REGISTRATION_TEACHER_REJECTED', `Class Teacher rejected ${reqItem.requestedRole} registration for ${reqItem.applicantName}. Reason: ${reason}`);
+
+  res.json({ success: true, registrationRequest: reqItem });
+});
+
+// Admin Registration Requests API
+app.get('/api/admin/registration-requests', (req: Request, res: Response) => {
+  const { status } = req.query;
+  let results = [...registrationRequestsStore];
+  if (status) {
+    results = results.filter((r) => r.status === status);
+  }
+  res.json(results);
+});
+
+// Admin Stage 2: Final Approval
+app.post('/api/admin/registration-requests/:id/approve', (req: Request, res: Response) => {
+  const { adminName, adminRole, userRole, reason } = req.body;
+  const role = userRole || adminRole;
+  if (role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Only administrators can grant final registration approval.' });
+  }
+
+  const index = registrationRequestsStore.findIndex((r) => r.id === req.params.id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Registration request not found' });
+  }
+
+  const reqItem = registrationRequestsStore[index];
+
+  // State Transition Rule: Admin can approve ONLY when status is PENDING_ADMIN_REVIEW
+  if (reqItem.status !== 'PENDING_ADMIN_REVIEW') {
+    return res.status(400).json({
+      error: `Invalid transition. This registration is in status "${reqItem.status}" and has not completed Class Teacher verification.`
+    });
+  }
+
+  reqItem.status = 'APPROVED';
+  reqItem.adminReviewedBy = adminName || 'Administrator';
+  reqItem.adminReviewedAt = new Date().toISOString();
+  reqItem.adminReviewReason = reason || 'Institutional clearance approved.';
+  reqItem.updatedAt = new Date().toISOString();
+
+  // Transactionally activate user account
+  const userIdx = usersStore.findIndex((u) => u.id === reqItem.userId);
+  if (userIdx !== -1) {
+    usersStore[userIdx].status = 'APPROVED';
+    usersStore[userIdx].accountStatus = 'ACTIVE';
+  }
+
+  // Notify student/parent
+  notificationsStore.unshift({
+    id: `notif-${Date.now()}`,
+    userId: reqItem.userId,
+    title: 'Account Activated',
+    message: `Your ${reqItem.requestedRole} account has received final Administrator approval. You may now log in.`,
+    type: 'SYSTEM',
+    createdAt: new Date().toISOString(),
+    isRead: false
+  });
+
+  addAuditLog(adminName || 'Admin', 'ADMIN', 'REGISTRATION_ADMIN_APPROVED', `Admin completed final approval and activated account for ${reqItem.applicantName} (${reqItem.applicantEmail})`);
+
+  res.json({ success: true, registrationRequest: reqItem, user: userIdx !== -1 ? usersStore[userIdx] : null });
+});
+
+// Admin Stage 2: Final Rejection
+app.post('/api/admin/registration-requests/:id/reject', (req: Request, res: Response) => {
+  const { adminName, reason } = req.body;
+  const index = registrationRequestsStore.findIndex((r) => r.id === req.params.id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Registration request not found' });
+  }
+
+  const reqItem = registrationRequestsStore[index];
+
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: 'A specific reason is required to reject a registration.' });
+  }
+
+  reqItem.status = 'REJECTED_BY_ADMIN';
+  reqItem.adminReviewedBy = adminName || 'Administrator';
+  reqItem.adminReviewedAt = new Date().toISOString();
+  reqItem.adminReviewReason = reason.trim();
+  reqItem.updatedAt = new Date().toISOString();
+
+  const userIdx = usersStore.findIndex((u) => u.id === reqItem.userId);
+  if (userIdx !== -1) {
+    usersStore[userIdx].status = 'REJECTED';
+    usersStore[userIdx].accountStatus = 'REJECTED';
+  }
+
+  addAuditLog(adminName || 'Admin', 'ADMIN', 'REGISTRATION_ADMIN_REJECTED', `Admin rejected registration for ${reqItem.applicantName}. Reason: ${reason}`);
+
+  res.json({ success: true, registrationRequest: reqItem });
+});
+
+// Admin Creates Another Administrator (Security Verified: req.user role must be ADMIN)
+app.post('/api/admin/users/admin', (req: Request, res: Response) => {
+  const { creatorRole, creatorName, name, email, department } = req.body;
+
+  if (creatorRole !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Only authenticated administrators can create new administrator accounts.' });
+  }
+
+  if (!name || !email) {
+    return res.status(400).json({ error: 'Administrator name and email are required.' });
+  }
+
+  const existing = usersStore.find((u) => u.email.toLowerCase() === email.trim().toLowerCase());
+  if (existing) {
+    return res.status(409).json({ error: 'An account with this email already exists.' });
+  }
+
+  const newAdmin: any = {
+    id: `usr-admin-${Date.now()}`,
+    name: name.trim(),
+    email: email.trim().toLowerCase(),
+    role: 'ADMIN',
+    status: 'APPROVED',
+    accountStatus: 'ACTIVE',
+    department: department || 'University Administration',
+    createdAt: new Date().toISOString(),
+    avatarUrl: `https://images.unsplash.com/photo-${1534528741775 + Math.floor(Math.random() * 1000)}?w=150&auto=format&fit=crop&q=80`
+  };
+
+  usersStore.push(newAdmin);
+
+  addAuditLog(creatorName || 'Admin', 'ADMIN', 'ADMIN_CREATED_ADMIN', `Administrator created new Admin account for ${newAdmin.name} (${newAdmin.email})`);
+
+  res.status(201).json({
+    success: true,
+    message: `Administrator account for ${newAdmin.name} created successfully.`,
+    user: newAdmin
+  });
 });
 
 // Users / Students / Faculty API
@@ -259,19 +579,128 @@ app.delete('/api/courses/:id', (req: Request, res: Response) => {
   res.json({ success: true, message: 'Course deleted' });
 });
 
-// Course Materials API
+// Course Materials & Teaching Videos API
 app.get('/api/materials', (req: Request, res: Response) => {
-  const { courseId } = req.query;
+  const { courseId, facultyId, status, type } = req.query;
+  let results = [...materialsStore];
   if (courseId) {
-    return res.json(materialsStore.filter((m) => m.courseId === courseId));
+    results = results.filter((m) => m.courseId === courseId);
   }
-  res.json(materialsStore);
+  if (facultyId) {
+    results = results.filter((m) => m.facultyId === facultyId);
+  }
+  if (status) {
+    results = results.filter((m) => m.status === status);
+  }
+  if (type) {
+    results = results.filter((m) => m.type === type);
+  }
+  res.json(results);
+});
+
+app.get('/api/materials/:id', (req: Request, res: Response) => {
+  const item = materialsStore.find((m) => m.id === req.params.id);
+  if (!item) return res.status(404).json({ error: 'Learning material not found' });
+  res.json(item);
 });
 
 app.post('/api/materials', (req: Request, res: Response) => {
-  const newMaterial = { id: `mat-${Date.now()}`, uploadedAt: new Date().toISOString().split('T')[0], ...req.body };
-  materialsStore.push(newMaterial);
+  const { courseId, facultyId, title, description, type, url, fileUrl, moduleName, status, performedBy, userRole } = req.body;
+  
+  if (!courseId || !title) {
+    return res.status(400).json({ error: 'courseId and title are required' });
+  }
+
+  // Authorize: If caller is FACULTY, verify course assignment
+  const targetCourse = coursesStore.find((c) => c.id === courseId);
+  if (!targetCourse) {
+    return res.status(404).json({ error: 'Target course not found' });
+  }
+
+  if (userRole === 'FACULTY' && facultyId && !isFacultyAssignedToCourse(targetCourse, facultyId)) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned to instruct this course' });
+  }
+
+  // YouTube URL extraction if type is YOUTUBE or VIDEO with youtube url
+  let youtubeVideoId: string | undefined;
+  let thumbnailUrl: string | undefined;
+  const targetUrl = url || fileUrl || '';
+
+  if (type === 'YOUTUBE' || (type === 'VIDEO' && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')))) {
+    const regExp = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
+    const match = targetUrl.match(regExp);
+    if (match && match[1]) {
+      youtubeVideoId = match[1];
+      thumbnailUrl = `https://img.youtube.com/vi/${youtubeVideoId}/hqdefault.jpg`;
+    } else if (type === 'YOUTUBE') {
+      return res.status(400).json({ error: 'Invalid YouTube URL provided. Please enter a valid YouTube link.' });
+    }
+  }
+
+  const newMaterial: any = {
+    id: `mat-${Date.now()}`,
+    courseId,
+    facultyId: facultyId || targetCourse.facultyId,
+    title: title.trim(),
+    description: description || '',
+    type: type || 'PDF',
+    fileType: type === 'YOUTUBE' ? 'VIDEO' : (type || 'PDF'),
+    url: targetUrl,
+    fileUrl: targetUrl,
+    size: req.body.size || (type === 'YOUTUBE' ? 'Stream' : '2.4 MB'),
+    fileSize: req.body.fileSize || (type === 'YOUTUBE' ? 'Stream' : '2.4 MB'),
+    moduleName: moduleName || 'General Module',
+    status: status || 'PUBLISHED',
+    youtubeVideoId,
+    thumbnailUrl,
+    uploadedAt: new Date().toISOString().split('T')[0]
+  };
+
+  materialsStore.unshift(newMaterial);
+
+  // Notify students if published
+  if (newMaterial.status === 'PUBLISHED') {
+    notificationsStore.unshift({
+      id: `notif-${Date.now()}`,
+      title: type === 'YOUTUBE' ? 'New Teaching Video Added' : 'New Study Material Published',
+      message: `${targetCourse.code}: "${newMaterial.title}" is now available for review.`,
+      type: 'ASSIGNMENT',
+      createdAt: new Date().toISOString(),
+      isRead: false
+    });
+  }
+
+  addAuditLog(performedBy || 'Faculty', userRole || 'FACULTY', 'MATERIAL_CREATE', `Created ${newMaterial.type} resource "${newMaterial.title}" for ${targetCourse.code}`);
+
   res.status(201).json(newMaterial);
+});
+
+app.put('/api/materials/:id', (req: Request, res: Response) => {
+  const index = materialsStore.findIndex((m) => m.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Material not found' });
+
+  const existing = materialsStore[index];
+  const { performedBy, userRole, facultyId } = req.body;
+
+  // Authorization check
+  const targetCourse = coursesStore.find((c) => c.id === existing.courseId);
+  if (userRole === 'FACULTY' && facultyId && targetCourse && !isFacultyAssignedToCourse(targetCourse, facultyId)) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned to instruct this course' });
+  }
+
+  materialsStore[index] = { ...existing, ...req.body, updatedAt: new Date().toISOString() };
+  addAuditLog(performedBy || 'Faculty', userRole || 'FACULTY', 'MATERIAL_UPDATE', `Updated resource "${materialsStore[index].title}"`);
+  res.json(materialsStore[index]);
+});
+
+app.delete('/api/materials/:id', (req: Request, res: Response) => {
+  const index = materialsStore.findIndex((m) => m.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Material not found' });
+
+  const deleted = materialsStore[index];
+  materialsStore.splice(index, 1);
+  addAuditLog('Faculty', 'FACULTY', 'MATERIAL_DELETE', `Deleted resource "${deleted.title}"`);
+  res.json({ success: true, message: 'Resource removed successfully' });
 });
 
 // Assignments API
@@ -280,6 +709,12 @@ app.get('/api/assignments', (req: Request, res: Response) => {
 });
 
 app.post('/api/assignments', (req: Request, res: Response) => {
+  const { courseId, facultyId, userRole, performedBy } = req.body;
+  const targetCourse = coursesStore.find((c) => c.id === courseId);
+  if (userRole === 'FACULTY' && facultyId && targetCourse && !isFacultyAssignedToCourse(targetCourse, facultyId)) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned to instruct this course' });
+  }
+
   const newAssignment = { id: `asg-${Date.now()}`, createdAt: new Date().toISOString().split('T')[0], ...req.body };
   assignmentsStore.push(newAssignment);
   
@@ -297,6 +732,32 @@ app.post('/api/assignments', (req: Request, res: Response) => {
   res.status(201).json(newAssignment);
 });
 
+app.put('/api/assignments/:id', (req: Request, res: Response) => {
+  const index = assignmentsStore.findIndex((a) => a.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Assignment not found' });
+
+  const existing = assignmentsStore[index];
+  const { performedBy, userRole, facultyId } = req.body;
+  const targetCourse = coursesStore.find((c) => c.id === existing.courseId);
+  if (userRole === 'FACULTY' && facultyId && targetCourse && !isFacultyAssignedToCourse(targetCourse, facultyId)) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned to this course' });
+  }
+
+  assignmentsStore[index] = { ...existing, ...req.body };
+  addAuditLog(performedBy || 'Faculty', userRole || 'FACULTY', 'ASSIGNMENT_UPDATE', `Updated assignment "${assignmentsStore[index].title}"`);
+  res.json(assignmentsStore[index]);
+});
+
+app.delete('/api/assignments/:id', (req: Request, res: Response) => {
+  const index = assignmentsStore.findIndex((a) => a.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Assignment not found' });
+
+  const deleted = assignmentsStore[index];
+  assignmentsStore.splice(index, 1);
+  addAuditLog('Faculty', 'FACULTY', 'ASSIGNMENT_DELETE', `Deleted assignment "${deleted.title}"`);
+  res.json({ success: true, message: 'Assignment removed' });
+});
+
 // Submissions API
 app.get('/api/submissions', (req: Request, res: Response) => {
   const { assignmentId, studentId } = req.query;
@@ -307,6 +768,11 @@ app.get('/api/submissions', (req: Request, res: Response) => {
 });
 
 app.post('/api/submissions', (req: Request, res: Response) => {
+  const { userRole, studentRole } = req.body;
+  if (userRole === 'ADMIN' || studentRole === 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Administrator accounts are strictly prohibited from submitting coursework.' });
+  }
+
   const newSubmission = {
     id: `sub-${Date.now()}`,
     submittedAt: new Date().toISOString(),
@@ -344,35 +810,154 @@ app.put('/api/submissions/:id/grade', (req: Request, res: Response) => {
 
 // Quizzes API
 app.get('/api/quizzes', (req: Request, res: Response) => {
-  res.json(quizzesStore);
+  const { courseId, isPublished } = req.query;
+  let results = [...quizzesStore];
+  if (courseId) {
+    results = results.filter((q) => q.courseId === courseId);
+  }
+  if (isPublished !== undefined) {
+    const pubVal = isPublished === 'true';
+    results = results.filter((q) => q.isPublished === pubVal);
+  }
+  res.json(results);
+});
+
+app.get('/api/quizzes/:id', (req: Request, res: Response) => {
+  const quiz = quizzesStore.find((q) => q.id === req.params.id);
+  if (!quiz) return res.status(404).json({ error: 'Quiz not found' });
+  res.json(quiz);
+});
+
+app.get('/api/quizzes/:id/analytics', (req: Request, res: Response) => {
+  const quiz = quizzesStore.find((q) => q.id === req.params.id);
+  if (!quiz) return res.status(404).json({ error: 'Quiz not found' });
+
+  const attempts = quizAttemptsStore.filter((qa) => qa.quizId === quiz.id);
+  const targetCourse = coursesStore.find((c) => c.id === quiz.courseId);
+  const totalStudents = targetCourse?.enrolledStudentsCount || 40;
+
+  const attemptedCount = attempts.length;
+  const notAttemptedCount = Math.max(0, totalStudents - attemptedCount);
+
+  let averageScore = 0;
+  let highestScore = 0;
+  let lowestScore = attemptedCount > 0 ? quiz.totalMarks : 0;
+  let passedCount = 0;
+
+  const distribution = {
+    '90-100%': 0,
+    '80-89%': 0,
+    '70-79%': 0,
+    '60-69%': 0,
+    '<60%': 0
+  };
+
+  attempts.forEach((a) => {
+    const pct = quiz.totalMarks > 0 ? (a.score / quiz.totalMarks) * 100 : 0;
+    averageScore += a.score;
+    if (a.score > highestScore) highestScore = a.score;
+    if (a.score < lowestScore) lowestScore = a.score;
+    if (pct >= 50) passedCount++;
+
+    if (pct >= 90) distribution['90-100%']++;
+    else if (pct >= 80) distribution['80-89%']++;
+    else if (pct >= 70) distribution['70-79%']++;
+    else if (pct >= 60) distribution['60-69%']++;
+    else distribution['<60%']++;
+  });
+
+  if (attemptedCount > 0) {
+    averageScore = Number((averageScore / attemptedCount).toFixed(1));
+  }
+
+  const passPercentage = attemptedCount > 0 ? Math.round((passedCount / attemptedCount) * 100) : 0;
+
+  res.json({
+    quizId: quiz.id,
+    quizTitle: quiz.title,
+    courseCode: quiz.courseCode,
+    totalMarks: quiz.totalMarks,
+    enrolledStudents: totalStudents,
+    attemptedCount,
+    notAttemptedCount,
+    averageScore,
+    highestScore,
+    lowestScore,
+    passPercentage,
+    distribution,
+    recentAttempts: attempts.slice(0, 10)
+  });
 });
 
 app.post('/api/quizzes', (req: Request, res: Response) => {
+  const { courseId, facultyId, userRole, performedBy } = req.body;
+  const targetCourse = coursesStore.find((c) => c.id === courseId);
+  if (!targetCourse) return res.status(404).json({ error: 'Target course not found' });
+
+  if (userRole === 'FACULTY' && facultyId && !isFacultyAssignedToCourse(targetCourse, facultyId)) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned to this course' });
+  }
+
   const newQuiz = {
     id: `qz-${Date.now()}`,
+    courseCode: targetCourse.code,
+    courseTitle: targetCourse.title,
     createdAt: new Date().toISOString().split('T')[0],
-    isPublished: true,
+    isPublished: req.body.isPublished ?? true,
     ...req.body
   };
   quizzesStore.push(newQuiz);
   
-  notificationsStore.unshift({
-    id: `notif-${Date.now()}`,
-    title: 'New Quiz Available',
-    message: `Quiz "${newQuiz.title}" is ready to attempt! Duration: ${newQuiz.durationMinutes} mins.`,
-    type: 'QUIZ',
-    createdAt: new Date().toISOString(),
-    isRead: false
-  });
+  if (newQuiz.isPublished) {
+    notificationsStore.unshift({
+      id: `notif-${Date.now()}`,
+      title: 'New Quiz Available',
+      message: `Quiz "${newQuiz.title}" is ready to attempt! Duration: ${newQuiz.durationMinutes} mins.`,
+      type: 'QUIZ',
+      createdAt: new Date().toISOString(),
+      isRead: false
+    });
+  }
+
+  addAuditLog(performedBy || 'Faculty', userRole || 'FACULTY', 'QUIZ_CREATE', `Created quiz "${newQuiz.title}" for ${targetCourse.code || targetCourse.mnemonic}`);
 
   res.status(201).json(newQuiz);
 });
 
+app.put('/api/quizzes/:id', (req: Request, res: Response) => {
+  const index = quizzesStore.findIndex((q) => q.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Quiz not found' });
+
+  const existing = quizzesStore[index];
+  const { performedBy, userRole, facultyId } = req.body;
+  const targetCourse = coursesStore.find((c) => c.id === existing.courseId);
+  if (userRole === 'FACULTY' && facultyId && targetCourse && !isFacultyAssignedToCourse(targetCourse, facultyId)) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned to this course' });
+  }
+
+  quizzesStore[index] = { ...existing, ...req.body };
+  addAuditLog(performedBy || 'Faculty', userRole || 'FACULTY', 'QUIZ_UPDATE', `Updated quiz "${quizzesStore[index].title}"`);
+  res.json(quizzesStore[index]);
+});
+
+app.delete('/api/quizzes/:id', (req: Request, res: Response) => {
+  const index = quizzesStore.findIndex((q) => q.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Quiz not found' });
+
+  const deleted = quizzesStore[index];
+  quizzesStore.splice(index, 1);
+  addAuditLog('Faculty', 'FACULTY', 'QUIZ_DELETE', `Deleted quiz "${deleted.title}"`);
+  res.json({ success: true, message: 'Quiz removed successfully' });
+});
+
 app.post('/api/quizzes/:id/submit', (req: Request, res: Response) => {
+  const { studentId, studentName, answers, timeTakenSeconds, userRole } = req.body;
+  if (userRole === 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Administrator accounts are strictly prohibited from attempting quizzes.' });
+  }
+
   const quiz = quizzesStore.find((q) => q.id === req.params.id);
   if (!quiz) return res.status(404).json({ error: 'Quiz not found' });
-
-  const { studentId, studentName, answers, timeTakenSeconds } = req.body;
   
   let score = 0;
   quiz.questions.forEach((q) => {
@@ -401,27 +986,213 @@ app.post('/api/quizzes/:id/submit', (req: Request, res: Response) => {
 });
 
 app.get('/api/quiz-attempts', (req: Request, res: Response) => {
-  res.json(quizAttemptsStore);
+  const { quizId, studentId } = req.query;
+  let results = [...quizAttemptsStore];
+  if (quizId) results = results.filter((q) => q.quizId === quizId);
+  if (studentId) results = results.filter((q) => q.studentId === studentId);
+  res.json(results);
 });
 
 // Attendance API
 app.get('/api/attendance', (req: Request, res: Response) => {
-  res.json(attendanceStore);
+  const { courseId, studentId, date, requesterRole, requesterId } = req.query;
+  
+  // Security enforcement: If student requests, can only access own attendance
+  if (requesterRole === 'STUDENT' && requesterId && studentId && requesterId !== studentId) {
+    return res.status(403).json({ error: 'Forbidden: Students are strictly restricted to their own attendance records.' });
+  }
+
+  // Security enforcement: If parent requests, can only access authorized child
+  if (requesterRole === 'PARENT' && requesterId && studentId) {
+    const parent = usersStore.find((u) => u.id === requesterId);
+    if (!parent || !parent.childStudentIds?.includes(studentId as string)) {
+      return res.status(403).json({ error: 'Forbidden: Parents are strictly restricted to their authorized children.' });
+    }
+  }
+
+  let results = [...attendanceStore];
+  if (courseId) results = results.filter((a) => a.courseId === courseId);
+  if (studentId) results = results.filter((a) => a.studentId === studentId);
+  if (date) results = results.filter((a) => a.date === date);
+
+  // Sort newest first
+  results.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  res.json(results);
+});
+
+// Student attendance summary & analytics endpoint (Single source of truth)
+app.get('/api/attendance/summary/:studentId', (req: Request, res: Response) => {
+  const { studentId } = req.params;
+  const { requesterId, requesterRole } = req.query;
+
+  // Authorization validation
+  if (requesterRole === 'STUDENT' && requesterId && requesterId !== studentId) {
+    return res.status(403).json({ error: 'Forbidden: You cannot access another student\'s attendance summary.' });
+  }
+
+  if (requesterRole === 'PARENT' && requesterId) {
+    const parent = usersStore.find((u) => u.id === requesterId);
+    if (!parent || !parent.childStudentIds?.includes(studentId)) {
+      return res.status(403).json({ error: 'Forbidden: Student is not an authorized ward of this parent account.' });
+    }
+  }
+
+  const student = usersStore.find((u) => u.id === studentId);
+  if (!student) return res.status(404).json({ error: 'Student record not found' });
+
+  // Get enrolled courses and records
+  const studentRecords = attendanceStore.filter((a) => a.studentId === studentId);
+  const enrolledCourses = coursesStore.filter((c) => student.classId ? true : true); // courses available in curriculum
+
+  const totalSessions = studentRecords.length;
+  const presentCount = studentRecords.filter((a) => a.status === 'PRESENT').length;
+  const lateCount = studentRecords.filter((a) => a.status === 'LATE').length;
+  const absentCount = studentRecords.filter((a) => a.status === 'ABSENT').length;
+  const overallPercentage = totalSessions > 0 ? Math.round((presentCount / totalSessions) * 100) : 100;
+  const isCompliant = overallPercentage >= 75;
+
+  // Subject-wise breakdown
+  const subjectMetrics = enrolledCourses.map((crs) => {
+    const cRecords = studentRecords.filter((r) => r.courseId === crs.id);
+    const cTotal = cRecords.length;
+    const cPresent = cRecords.filter((r) => r.status === 'PRESENT').length;
+    const cLate = cRecords.filter((r) => r.status === 'LATE').length;
+    const cAbsent = cRecords.filter((r) => r.status === 'ABSENT').length;
+    const cPct = cTotal > 0 ? Math.round((cPresent / cTotal) * 100) : 100;
+    const cCompliant = cPct >= 75;
+    const needed = (!cCompliant && cTotal > 0) ? Math.max(1, Math.ceil(3 * cTotal - 4 * cPresent)) : 0;
+
+    return {
+      courseId: crs.id,
+      courseCode: crs.code,
+      courseName: crs.title,
+      facultyName: crs.facultyName,
+      present: cPresent,
+      late: cLate,
+      absent: cAbsent,
+      total: cTotal,
+      percentage: cPct,
+      status: cCompliant ? 'COMPLIANT' : 'WARNING',
+      shortageCount: needed
+    };
+  });
+
+  const recent = [...studentRecords]
+    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+    .slice(0, 8);
+
+  res.json({
+    studentId,
+    studentName: student.name,
+    regNumber: student.regNumber,
+    overall: {
+      percentage: overallPercentage,
+      present: presentCount,
+      late: lateCount,
+      absent: absentCount,
+      total: totalSessions,
+      threshold: 75,
+      status: isCompliant ? 'COMPLIANT' : 'WARNING',
+      shortageCount: (!isCompliant && totalSessions > 0) ? Math.max(1, Math.ceil(3 * totalSessions - 4 * presentCount)) : 0
+    },
+    subjects: subjectMetrics,
+    recent
+  });
+});
+
+// Timetable Endpoints
+app.get('/api/timetable', (req: Request, res: Response) => {
+  res.json(timetableStore);
+});
+
+// Single attendance record correction (Faculty/Admin only)
+app.put('/api/attendance/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { status, performedBy, userRole, reason } = req.body;
+
+  if (userRole !== 'FACULTY' && userRole !== 'ADMIN') {
+    return res.status(403).json({ error: 'Forbidden: Only faculty instructors and administrators may correct attendance.' });
+  }
+
+  const index = attendanceStore.findIndex((a) => a.id === id);
+  if (index === -1) return res.status(404).json({ error: 'Attendance record not found' });
+
+  const prev = attendanceStore[index];
+  const oldStatus = prev.status;
+  attendanceStore[index] = { ...prev, status };
+
+  addAuditLog(
+    performedBy || 'Faculty',
+    userRole || 'FACULTY',
+    'ATTENDANCE_CORRECTED',
+    `Corrected attendance for student ${prev.studentName} on ${prev.date} in ${prev.courseCode || prev.courseId}: ${oldStatus} -> ${status}${reason ? ` (Reason: ${reason})` : ''}`
+  );
+
+  res.json({ success: true, updated: attendanceStore[index] });
 });
 
 app.post('/api/attendance', (req: Request, res: Response) => {
   const records = req.body.records; // array of records
+  const { performedBy, userRole, facultyId } = req.body;
+
   if (Array.isArray(records)) {
     records.forEach((r: any) => {
+      // Prevent duplicate attendance for same (course_id, student_id, date)
       const existing = attendanceStore.findIndex((a) => a.courseId === r.courseId && a.studentId === r.studentId && a.date === r.date);
       if (existing !== -1) {
         attendanceStore[existing].status = r.status;
       } else {
-        attendanceStore.push({ id: `att-${Date.now()}-${Math.random()}`, ...r });
+        attendanceStore.push({ id: `att-${Date.now()}-${Math.floor(Math.random() * 10000)}`, ...r });
       }
     });
+
+    addAuditLog(performedBy || 'Faculty', userRole || 'FACULTY', 'ATTENDANCE_UPDATE', `Marked attendance for ${records.length} students`);
   }
   res.json({ success: true, count: records?.length || 0 });
+});
+
+app.post('/api/courses/:courseId/attendance/bulk', (req: Request, res: Response) => {
+  const { courseId } = req.params;
+  const { date, records, facultyId, userRole, performedBy } = req.body;
+
+  const targetCourse = coursesStore.find((c) => c.id === courseId);
+  if (!targetCourse) return res.status(404).json({ error: 'Course not found' });
+
+  if (userRole === 'FACULTY' && facultyId && !isFacultyAssignedToCourse(targetCourse, facultyId)) {
+    return res.status(403).json({ error: 'Forbidden: You are not assigned to instruct this course' });
+  }
+
+  if (!date || !Array.isArray(records)) {
+    return res.status(400).json({ error: 'Valid date and records array required' });
+  }
+
+  let updatedCount = 0;
+  records.forEach((rec: any) => {
+    const existing = attendanceStore.findIndex((a) => a.courseId === courseId && a.studentId === rec.studentId && a.date === date);
+    if (existing !== -1) {
+      const oldStatus = attendanceStore[existing].status;
+      attendanceStore[existing].status = rec.status;
+      if (oldStatus !== rec.status) {
+        addAuditLog(performedBy || 'Faculty', 'FACULTY', 'ATTENDANCE_CORRECTED', `Updated attendance for ${rec.studentName} in ${targetCourse.code} on ${date}: ${oldStatus} -> ${rec.status}`);
+      }
+    } else {
+      attendanceStore.push({
+        id: `att-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+        courseId,
+        courseCode: targetCourse.code,
+        courseName: targetCourse.title,
+        studentId: rec.studentId,
+        studentName: rec.studentName,
+        date,
+        status: rec.status
+      });
+    }
+    updatedCount++;
+  });
+
+  addAuditLog(performedBy || 'Faculty', 'FACULTY', 'ATTENDANCE_RECORDED', `Recorded session attendance for ${targetCourse.code} on ${date} (${updatedCount} students)`);
+
+  res.json({ success: true, count: updatedCount, date, courseCode: targetCourse.code });
 });
 
 // Notifications API
@@ -754,34 +1525,199 @@ public class CourseController {
   });
 });
 
-// Gemini AI Assistant Endpoint
-app.post('/api/ai/assistant', async (req: Request, res: Response) => {
-  try {
-    const { prompt, context } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY;
+// ==========================================
+// INSTITUTIONAL BILLING & FEES REST APIS
+// ==========================================
 
-    if (!apiKey) {
-      return res.status(200).json({
-        text: `[EduTrack AI Assistant] Gemini API key is not configured yet. Here is an automated smart response:\n\nRegarding "${prompt}": In EduTrack LMS, you can easily manage courses, review grades, generate MCQ quizzes, and export performance reports to Excel or PDF!`
-      });
-    }
-
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: `You are the EduTrack AI Academic Assistant embedded in EduTrack LMS.
-Context: ${context || 'General University LMS context'}
-User prompt: ${prompt}
-
-Provide a helpful, precise, structured academic response.`
-    });
-
-    res.json({ text: response.text });
-  } catch (error: any) {
-    console.error('Gemini API Error:', error);
-    res.status(500).json({ error: error.message || 'Error processing AI request' });
+// Get Fees (with optional studentId or status filters)
+app.get('/api/fees', (req: Request, res: Response) => {
+  const { studentId, status } = req.query;
+  let results = [...feeStore];
+  if (studentId) {
+    results = results.filter((f) => f.studentId === studentId);
   }
+  if (status) {
+    results = results.filter((f) => f.status === status);
+  }
+  res.json(results);
 });
+
+// Student or Parent Pays a Fee Record
+app.post('/api/fees/:id/pay', (req: Request, res: Response) => {
+  const { paymentMethod, transactionRef, paidBy, payerRole } = req.body;
+  const index = feeStore.findIndex((f) => f.id === req.params.id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Fee invoice record not found' });
+  }
+
+  const fee = feeStore[index];
+  if (fee.status === 'PAID') {
+    return res.status(400).json({ error: 'This invoice has already been cleared.' });
+  }
+
+  const now = new Date().toISOString();
+  const generatedReceipt = `REC-${Date.now().toString().slice(-6)}-${fee.category.slice(0, 3)}`;
+
+  fee.status = 'PAID';
+  fee.paidAt = now;
+  fee.paidAmount = fee.amount;
+  fee.paymentMethod = paymentMethod || 'UPI';
+  fee.transactionRef = transactionRef || `TXN-${Date.now().toString().slice(-8)}`;
+  fee.receiptNumber = generatedReceipt;
+  fee.remarks = `Cleared by ${paidBy || 'Payer'} (${payerRole || 'STUDENT'}) via ${paymentMethod || 'UPI'}`;
+
+  // Log in institutional audit trail
+  addAuditLog(
+    paidBy || 'Student/Parent',
+    payerRole || 'STUDENT',
+    'FEE_PAYMENT',
+    `Payment of ₹${fee.amount.toLocaleString('en-IN')} received for ${fee.title} (Student: ${fee.studentName}, Receipt: ${generatedReceipt})`
+  );
+
+  // Send Notification to Student
+  notificationsStore.unshift({
+    id: `notif-${Date.now()}-stu`,
+    userId: fee.studentId,
+    title: 'Fee Payment Received',
+    message: `Receipt ${generatedReceipt}: ₹${fee.amount.toLocaleString('en-IN')} cleared for ${fee.title}.`,
+    type: 'BILLING',
+    createdAt: now,
+    isRead: false
+  });
+
+  // Find linked parents for this student and notify them
+  const linkedParents = usersStore.filter(
+    (u) => u.role === 'PARENT' && u.childStudentIds?.includes(fee.studentId)
+  );
+  linkedParents.forEach((parent) => {
+    notificationsStore.unshift({
+      id: `notif-${Date.now()}-parent-${parent.id}`,
+      userId: parent.id,
+      title: 'Ward Fee Cleared',
+      message: `Payment confirmation: ₹${fee.amount.toLocaleString('en-IN')} cleared for ${fee.studentName}'s ${fee.title} (Receipt: ${generatedReceipt}).`,
+      type: 'BILLING',
+      createdAt: now,
+      isRead: false
+    });
+  });
+
+  res.json({ success: true, fee, message: 'Fee payment successfully processed and receipt generated.' });
+});
+
+// Admin or Faculty Issues a Fee Dues Reminder Alert
+app.post('/api/fees/:id/remind', (req: Request, res: Response) => {
+  const { senderName, senderRole, customMessage } = req.body;
+  const index = feeStore.findIndex((f) => f.id === req.params.id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Fee record not found' });
+  }
+
+  const fee = feeStore[index];
+  const now = new Date().toISOString();
+  const alertTitle = fee.status === 'OVERDUE' ? '⚠️ OVERDUE Fee Reminder Alert' : '📢 Academic Fee Payment Reminder';
+  const alertMsg = customMessage || 
+    `${senderName} (${senderRole}): Reminder for ${fee.title} of ₹${fee.amount.toLocaleString('en-IN')} due on ${fee.dueDate}. Please clear pending dues immediately.`;
+
+  // Notify the student
+  notificationsStore.unshift({
+    id: `notif-${Date.now()}-remind-stu`,
+    userId: fee.studentId,
+    title: alertTitle,
+    message: alertMsg,
+    type: 'BILLING',
+    createdAt: now,
+    isRead: false
+  });
+
+  // Notify linked parent(s)
+  const linkedParents = usersStore.filter(
+    (u) => u.role === 'PARENT' && u.childStudentIds?.includes(fee.studentId)
+  );
+  linkedParents.forEach((parent) => {
+    notificationsStore.unshift({
+      id: `notif-${Date.now()}-remind-par-${parent.id}`,
+      userId: parent.id,
+      title: alertTitle,
+      message: `Parent Notice: ${fee.studentName} has a pending invoice for ${fee.title} (₹${fee.amount.toLocaleString('en-IN')}). Due date: ${fee.dueDate}.`,
+      type: 'BILLING',
+      createdAt: now,
+      isRead: false
+    });
+  });
+
+  // Add audit record
+  addAuditLog(
+    senderName || 'Instructor/Admin',
+    senderRole || 'FACULTY',
+    'FEE_REMINDER_SENT',
+    `Sent billing alert for ${fee.title} to student ${fee.studentName} and associated guardian(s).`
+  );
+
+  res.json({ success: true, message: `Fee alert successfully dispatched to ${fee.studentName} and guardians.` });
+});
+
+// Admin Creates New Fee Invoice
+app.post('/api/fees', (req: Request, res: Response) => {
+  const { studentId, category, title, description, amount, dueDate, semester, academicYear, creatorName, creatorRole } = req.body;
+  if (!studentId || !title || !amount || !dueDate) {
+    return res.status(400).json({ error: 'studentId, title, amount, and dueDate are required.' });
+  }
+
+  const student = usersStore.find((u) => u.id === studentId);
+  const newFee = {
+    id: `fee-${Date.now()}`,
+    studentId,
+    studentName: student?.name || 'Enrolled Student',
+    studentRegNumber: student?.regNumber,
+    semester: Number(semester) || student?.semester || 4,
+    academicYear: academicYear || '2026-2027',
+    category: category || 'TUITION',
+    title,
+    description: description || 'Mandatory university fees invoice.',
+    amount: Number(amount),
+    dueDate,
+    status: 'PENDING'
+  };
+
+  feeStore.unshift(newFee as any);
+
+  // Notify student & parents
+  const now = new Date().toISOString();
+  notificationsStore.unshift({
+    id: `notif-${Date.now()}-newfee`,
+    userId: studentId,
+    title: 'New Fee Invoice Generated',
+    message: `A new invoice of ₹${Number(amount).toLocaleString('en-IN')} for ${title} has been assigned to your account. Due: ${dueDate}.`,
+    type: 'BILLING',
+    createdAt: now,
+    isRead: false
+  });
+
+  const linkedParents = usersStore.filter((u) => u.role === 'PARENT' && u.childStudentIds?.includes(studentId));
+  linkedParents.forEach((parent) => {
+    notificationsStore.unshift({
+      id: `notif-${Date.now()}-newfee-par-${parent.id}`,
+      userId: parent.id,
+      title: 'New Student Fee Invoice',
+      message: `An invoice of ₹${Number(amount).toLocaleString('en-IN')} for ${title} was generated for your ward ${student?.name || 'Student'}. Due: ${dueDate}.`,
+      type: 'BILLING',
+      createdAt: now,
+      isRead: false
+    });
+  });
+
+  addAuditLog(
+    creatorName || 'Admin',
+    creatorRole || 'ADMIN',
+    'FEE_INVOICE_CREATED',
+    `Created fee invoice ${title} of ₹${Number(amount).toLocaleString('en-IN')} for student ${student?.name || studentId}`
+  );
+
+  res.status(201).json({ success: true, fee: newFee });
+});
+
 
 // Start Server with Vite Middleware
 async function startServer() {

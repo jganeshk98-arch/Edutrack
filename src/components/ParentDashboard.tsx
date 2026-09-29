@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
-import { User, Course, Submission, QuizAttempt, AttendanceRecord, ParentReview } from '../types';
+import { User, Course, Submission, QuizAttempt, AttendanceRecord, ParentReview, FeeRecord, PaymentMethod } from '../types';
+import { StudentBillingSection } from './student/StudentBillingSection';
+import { StudentAttendanceSection } from './student/StudentAttendanceSection';
 import {
   Users,
   Award,
@@ -8,13 +10,18 @@ import {
   HelpCircle,
   MessageSquarePlus,
   Send,
-  Sparkles,
   TrendingUp,
   AlertTriangle,
   CheckCircle2,
   Clock,
-  BookOpen
+  BookOpen,
+  HeartHandshake,
+  Receipt,
+  CreditCard,
+  MessageSquareQuote
 } from 'lucide-react';
+import { APP_CONFIG } from '../config/constants';
+import { calculateAttendanceMetrics } from '../utils/academic';
 import {
   ResponsiveContainer,
   BarChart,
@@ -35,7 +42,9 @@ interface ParentDashboardProps {
   quizAttempts: QuizAttempt[];
   attendance: AttendanceRecord[];
   reviews: ParentReview[];
+  fees?: FeeRecord[];
   onSubmitReview: (review: Omit<ParentReview, 'id' | 'createdAt' | 'status'>) => void;
+  onPayFee?: (feeId: string, paymentMethod: PaymentMethod, transactionRef: string) => void;
 }
 
 export const ParentDashboard: React.FC<ParentDashboardProps> = ({
@@ -46,9 +55,11 @@ export const ParentDashboard: React.FC<ParentDashboardProps> = ({
   quizAttempts,
   attendance,
   reviews,
-  onSubmitReview
+  fees = [],
+  onSubmitReview,
+  onPayFee
 }) => {
-  // Linked children
+  // Linked children strictly limited to this parent's authorized IDs
   const linkedChildren = allUsers.filter(
     (u) => u.role === 'STUDENT' && currentParent.childStudentIds?.includes(u.id)
   );
@@ -57,9 +68,17 @@ export const ParentDashboard: React.FC<ParentDashboardProps> = ({
     linkedChildren[0]?.id || ''
   );
 
+  // Keep selectedStudentId in sync if parent changes
+  React.useEffect(() => {
+    if (linkedChildren.length > 0 && !linkedChildren.some((c) => c.id === selectedStudentId)) {
+      setSelectedStudentId(linkedChildren[0].id);
+    }
+  }, [currentParent, linkedChildren, selectedStudentId]);
+
   const selectedStudent = linkedChildren.find((c) => c.id === selectedStudentId) || linkedChildren[0];
 
   // Forms state for Parent Review / Inquiry
+  const [activeTab, setActiveTab] = useState<'OVERVIEW' | 'ATTENDANCE' | 'BILLING' | 'REMARKS'>('OVERVIEW');
   const [reviewTitle, setReviewTitle] = useState('');
   const [reviewMessage, setReviewMessage] = useState('');
   const [reviewCategory, setReviewCategory] = useState<ParentReview['category']>('GENERAL');
@@ -68,16 +87,14 @@ export const ParentDashboard: React.FC<ParentDashboardProps> = ({
 
   // Student specific data
   const studentAttendance = attendance.filter((a) => a.studentId === selectedStudent?.id);
-  const presentCount = studentAttendance.filter((a) => a.status === 'PRESENT').length;
-  const absentCount = studentAttendance.filter((a) => a.status === 'ABSENT').length;
-  const lateCount = studentAttendance.filter((a) => a.status === 'LATE').length;
-  const attendanceRate = studentAttendance.length > 0
-    ? Math.round((presentCount / studentAttendance.length) * 100)
-    : 100;
+  const attendanceMetrics = calculateAttendanceMetrics(studentAttendance);
+  const { presentCount, lateCount, absentCount, attendanceRate } = attendanceMetrics;
 
   const studentSubmissions = submissions.filter((s) => s.studentId === selectedStudent?.id);
   const studentQuizAttempts = quizAttempts.filter((q) => q.studentId === selectedStudent?.id);
   const studentReviews = reviews.filter((r) => r.studentId === selectedStudent?.id);
+  const studentFees = fees.filter((f) => f.studentId === selectedStudent?.id);
+  const studentUnpaidFees = studentFees.filter((f) => f.status === 'PENDING' || f.status === 'OVERDUE');
 
   // Recharts data: Attendance Pie
   const attendanceData = [
@@ -136,7 +153,7 @@ export const ParentDashboard: React.FC<ParentDashboardProps> = ({
       <div className="p-6 rounded-2xl glass-panel bg-gradient-to-r from-purple-950/40 via-indigo-950/30 to-slate-900 border border-purple-500/20 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 text-purple-400 text-xs font-semibold tracking-wide uppercase">
-            <Sparkles className="w-4 h-4" />
+            <HeartHandshake className="w-4 h-4" />
             <span>Parent Academic Oversight Portal</span>
           </div>
           <h1 className="text-xl md:text-2xl font-bold text-white mt-1">
@@ -201,23 +218,28 @@ export const ParentDashboard: React.FC<ParentDashboardProps> = ({
         </div>
 
         {/* Attendance Rate */}
-        <div className="p-4 rounded-xl glass-card flex items-center justify-between">
+        <div
+          onClick={() => setActiveTab('ATTENDANCE')}
+          className="p-4 rounded-xl glass-card flex items-center justify-between cursor-pointer hover:border-indigo-500/50 transition-all group"
+        >
           <div>
-            <div className="text-xs text-slate-400 font-medium">Attendance Rate</div>
+            <div className="text-xs text-slate-400 font-medium group-hover:text-indigo-300 transition-colors">
+              Attendance Rate (Click to View Log)
+            </div>
             <div className="text-2xl font-black text-indigo-400 mt-0.5">{attendanceRate}%</div>
             <div className="text-[10px] text-slate-400 font-medium">
-              {attendanceRate < 75 ? (
+              {attendanceRate < APP_CONFIG.ATTENDANCE_STATUTORY_THRESHOLD ? (
                 <span className="text-rose-400 flex items-center gap-1">
-                  <AlertTriangle className="w-3 h-3" /> Below 75% Requirement
+                  <AlertTriangle className="w-3 h-3" /> Below {APP_CONFIG.ATTENDANCE_STATUTORY_THRESHOLD}% Requirement
                 </span>
               ) : (
                 <span className="text-emerald-400 flex items-center gap-1">
-                  <CheckCircle2 className="w-3 h-3" /> Compliant (75%+ Threshold)
+                  <CheckCircle2 className="w-3 h-3" /> Compliant ({APP_CONFIG.ATTENDANCE_STATUTORY_THRESHOLD}%+ Threshold)
                 </span>
               )}
             </div>
           </div>
-          <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+          <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center group-hover:bg-indigo-500/20 transition-colors">
             <CalendarCheck className="w-5 h-5 text-indigo-400" />
           </div>
         </div>
@@ -239,7 +261,167 @@ export const ParentDashboard: React.FC<ParentDashboardProps> = ({
         </div>
       </div>
 
-      {/* Visual Analytics Grid */}
+      {/* Parent Navigation Tabs */}
+      <div className="flex items-center gap-2 overflow-x-auto pb-1 border-b border-slate-800 text-xs">
+        <button
+          type="button"
+          onClick={() => setActiveTab('OVERVIEW')}
+          className={`px-4 py-2.5 rounded-xl font-bold flex items-center gap-2 whitespace-nowrap transition-all cursor-pointer ${
+            activeTab === 'OVERVIEW'
+              ? 'bg-purple-600 text-white shadow-md shadow-purple-600/25 ring-1 ring-purple-400/40'
+              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+          }`}
+        >
+          <Award className="w-4 h-4" />
+          <span>Academic Overview</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('ATTENDANCE')}
+          className={`px-4 py-2.5 rounded-xl font-bold flex items-center gap-2 whitespace-nowrap transition-all cursor-pointer ${
+            activeTab === 'ATTENDANCE'
+              ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/25 ring-1 ring-indigo-400/40'
+              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+          }`}
+        >
+          <CalendarCheck className="w-4 h-4" />
+          <span>Child Attendance (Live & Historical)</span>
+          {attendanceRate < APP_CONFIG.ATTENDANCE_STATUTORY_THRESHOLD && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full font-black bg-rose-500 text-white shadow-sm animate-pulse">
+              Warning
+            </span>
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('BILLING')}
+          className={`px-4 py-2.5 rounded-xl font-bold flex items-center gap-2 whitespace-nowrap transition-all cursor-pointer ${
+            activeTab === 'BILLING'
+              ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-600/25 ring-1 ring-emerald-400/40'
+              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+          }`}
+        >
+          <CreditCard className="w-4 h-4" />
+          <span>Ward Fee Clearance & Online Payments</span>
+          {studentUnpaidFees.length > 0 && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full font-black bg-rose-500 text-white shadow-sm animate-pulse">
+              {studentUnpaidFees.length} Due
+            </span>
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('REMARKS')}
+          className={`px-4 py-2.5 rounded-xl font-bold flex items-center gap-2 whitespace-nowrap transition-all cursor-pointer ${
+            activeTab === 'REMARKS'
+              ? 'bg-purple-600 text-white shadow-md shadow-purple-600/25 ring-1 ring-purple-400/40'
+              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+          }`}
+        >
+          <MessageSquarePlus className="w-4 h-4" />
+          <span>Inquiries & Instructor Reviews</span>
+          {studentReviews.length > 0 && (
+            <span className="text-[10px] px-2 py-0.2 rounded-full font-semibold bg-slate-800 text-slate-300">
+              {studentReviews.length}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* Child Subject-Wise Live & Historical Attendance Tab View */}
+      {activeTab === 'ATTENDANCE' && (
+        <div className="space-y-4 animate-in fade-in">
+          <div className="p-5 rounded-2xl glass-panel bg-gradient-to-r from-indigo-950/40 via-slate-900 to-purple-950/30 border border-indigo-500/30 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-lg">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-indigo-400 text-xs font-bold uppercase tracking-wider">
+                <CalendarCheck className="w-4 h-4" />
+                <span>Parental Ward Attendance & Compliance Monitoring</span>
+              </div>
+              <h2 className="text-base font-bold text-white">
+                Live & Historical Subject-Wise Attendance for {selectedStudent.name}
+              </h2>
+              <p className="text-xs text-slate-300">
+                Official instructional records submitted directly by faculty members. Real-time evaluation against the mandatory {APP_CONFIG.ATTENDANCE_STATUTORY_THRESHOLD}% statutory policy threshold.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <span className={`px-3.5 py-1.5 rounded-xl text-xs font-bold border flex items-center gap-1.5 ${
+                attendanceRate >= APP_CONFIG.ATTENDANCE_STATUTORY_THRESHOLD
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                  : 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+              }`}>
+                {attendanceRate >= APP_CONFIG.ATTENDANCE_STATUTORY_THRESHOLD ? (
+                  <>
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Compliance Verified</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    <span>Statutory Shortage</span>
+                  </>
+                )}
+              </span>
+            </div>
+          </div>
+
+          <StudentAttendanceSection
+            studentId={selectedStudent.id}
+            studentName={selectedStudent.name}
+            regNumber={selectedStudent.regNumber}
+            courses={courses}
+            attendanceRecords={attendance}
+            isParentView={true}
+          />
+        </div>
+      )}
+
+      {/* Ward Fee Clearance Tab View */}
+      {activeTab === 'BILLING' && (
+        <div className="space-y-4 animate-in fade-in">
+          <div className="p-5 rounded-2xl glass-panel bg-gradient-to-r from-emerald-950/40 via-slate-900 to-teal-950/30 border border-emerald-500/30 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-lg">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-emerald-400 text-xs font-bold uppercase tracking-wider">
+                <CreditCard className="w-4 h-4" />
+                <span>Parental Fee Clearance & Payment Hub</span>
+              </div>
+              <h2 className="text-base font-bold text-white">
+                Official Tuition & University Fees for {selectedStudent.name}
+              </h2>
+              <p className="text-xs text-slate-300">
+                Parents and legal guardians can directly settle semester dues online with instant 256-bit encrypted UPI/Card checkout and automated e-receipt issuance.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="px-3.5 py-1.5 rounded-xl text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>Instant University Clearance</span>
+              </span>
+            </div>
+          </div>
+
+          <StudentBillingSection
+            studentId={selectedStudent.id}
+            studentName={selectedStudent.name}
+            fees={fees}
+            onPayFee={(feeId, method, ref) => {
+              if (onPayFee) {
+                onPayFee(feeId, method, ref);
+              }
+            }}
+            isParentView={true}
+          />
+        </div>
+      )}
+
+      {/* Visual Analytics Grid (Overview Tab) */}
+      {activeTab === 'OVERVIEW' && (
+      <>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Attendance Breakdown Chart */}
         <div className="p-5 rounded-2xl glass-panel">
@@ -572,6 +754,142 @@ export const ParentDashboard: React.FC<ParentDashboardProps> = ({
           </div>
         </div>
       </div>
+      </>
+      )}
+
+      {/* When activeTab is REMARKS, show Inquiry & Remarks view */}
+      {activeTab === 'REMARKS' && (
+        <div className="space-y-6 animate-in fade-in max-w-4xl mx-auto">
+          <div className="p-5 rounded-2xl glass-panel">
+            <h3 className="text-base font-bold text-slate-200 mb-1 flex items-center gap-2">
+              <MessageSquarePlus className="w-5 h-5 text-purple-400" />
+              <span>Submit Academic Review / Inquiry for {selectedStudent.name}</span>
+            </h3>
+            <p className="text-xs text-slate-400 mb-4">
+              Send remarks, attendance inquiries, or feedback directly to instructors.
+            </p>
+
+            {showSubmitSuccess && (
+              <div className="mb-4 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Remark submitted and dispatched to course faculty!</span>
+              </div>
+            )}
+
+            <form onSubmit={handleReviewSubmit} className="space-y-3.5 text-xs">
+              <div>
+                <label className="block text-slate-300 font-medium mb-1">Category</label>
+                <select
+                  value={reviewCategory}
+                  onChange={(e) => setReviewCategory(e.target.value as any)}
+                  className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:border-purple-500"
+                >
+                  <option value="GENERAL">General Inquiries</option>
+                  <option value="ACADEMIC_CONCERN">Academic Concern / Grades</option>
+                  <option value="ATTENDANCE">Attendance Discrepancy / Leave Note</option>
+                  <option value="APPRECIATION">Faculty Appreciation</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-medium mb-1">Subject / Course (Optional)</label>
+                <select
+                  value={selectedCourseId}
+                  onChange={(e) => setSelectedCourseId(e.target.value)}
+                  className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-200 focus:outline-none focus:border-purple-500"
+                >
+                  <option value="">-- All / General Institution --</option>
+                  {courses.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.code}: {c.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-medium mb-1">Subject / Title</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Inquiry regarding Midterm Project"
+                  value={reviewTitle}
+                  onChange={(e) => setReviewTitle(e.target.value)}
+                  required
+                  className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-purple-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-medium mb-1">Detailed Message</label>
+                <textarea
+                  rows={3}
+                  placeholder="Enter message for academic staff..."
+                  value={reviewMessage}
+                  onChange={(e) => setReviewMessage(e.target.value)}
+                  required
+                  className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-purple-500 resize-none"
+                />
+              </div>
+
+              <div className="flex justify-end pt-1">
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>Send to Faculty</span>
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <div className="p-5 rounded-2xl glass-panel">
+            <h3 className="text-sm font-bold text-slate-200 mb-3 flex items-center gap-2">
+              <MessageSquareQuote className="w-4 h-4 text-purple-400" />
+              <span>Inquiry Communication History</span>
+            </h3>
+
+            <div className="space-y-3">
+              {studentReviews.length === 0 ? (
+                <div className="text-xs text-slate-500 py-4 text-center">No parent reviews submitted yet</div>
+              ) : (
+                studentReviews.map((rev) => (
+                  <div
+                    key={rev.id}
+                    className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-700/50 text-xs space-y-1.5"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-slate-200">{rev.title}</span>
+                      <span
+                        className={`text-[10px] px-2 py-0.5 rounded font-semibold ${
+                          rev.status === 'ACKNOWLEDGED'
+                            ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                            : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                        }`}
+                      >
+                        {rev.status}
+                      </span>
+                    </div>
+
+                    <p className="text-slate-400 text-[11px] leading-relaxed">{rev.message}</p>
+
+                    {rev.facultyReply && (
+                      <div className="p-2.5 rounded-lg bg-indigo-950/40 border border-indigo-500/20 text-[11px] text-indigo-300 mt-2">
+                        <span className="font-semibold block text-[10px] text-indigo-400">Faculty Response:</span>
+                        {rev.facultyReply}
+                      </div>
+                    )}
+
+                    <div className="text-[10px] text-slate-500 pt-1">
+                      {new Date(rev.createdAt).toLocaleDateString()}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
